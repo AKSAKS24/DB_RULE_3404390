@@ -38,6 +38,7 @@ class Unit(BaseModel):
     start_line: Optional[int] = 0
     end_line: Optional[int] = 0
     code: Optional[str] = ""
+    # Our findings output field:
     j1bbranch_findings: Optional[List[Finding]] = None
 
 # --- Regex for ABAP table usage ---
@@ -55,19 +56,6 @@ TABLE_USAGE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL
 )
 
-# --- Additional regex for declarations involving obsolete tables ---
-J1BBRANCH_TYPE_DECL_RE = re.compile(
-    r'''(
-        (?:DATA|FIELD-SYMBOLS|CONSTANTS|TYPES|STATICS|RANGES)\s*      # Data/Type declarations
-        (?::*\s*<*\w+>*\s+)?                                          # variable or field symbol (optional)
-        (?:TYPE|LIKE)\s+                                              # TYPE or LIKE
-        (?:TABLE\s+OF\s+)?                                            # optional TABLE OF
-    )
-    (J_1BBRANCH)\b                                                    # J_1BBRANCH referenced as a type
-    ''',
-    re.IGNORECASE | re.VERBOSE
-)
-
 def line_of_offset(text: str, off: int) -> int:
     return text.count("\n", 0, off) + 1
 
@@ -76,25 +64,32 @@ def snippet_at(text: str, start: int, end: int) -> str:
     e = min(len(text), end + 60)
     return text[s:e].replace("\n", "\\n")
 
-# --- Suggestion (NO code output!) ---
-def make_generic_suggestion(table: str, new_table: str) -> str:
-    return (
-        f"Use released CDS view {new_table} instead of obsolete table {table}. "
-        f"See SAP Note 3404390."
-    )
+def migrate_table_usage(keyword: str, table: str) -> Optional[str]:
+    t_up = table.upper()
+    if t_up in OBSOLETE_TABLE_MAP:
+        new_table = OBSOLETE_TABLE_MAP[t_up]
+        comment = (
+            f"* TODO: {t_up} is obsolete in S/4HANA (SAP Note 3404390). "
+            f"Use released CDS view {new_table} instead. Adjust field mappings accordingly."
+        )
+        if keyword.strip().upper().startswith("SELECT"):
+            return f"SELECT * FROM {new_table}\n{comment}"
+        else:
+            replaced_stmt = re.sub(rf"\b{table}\b", new_table, keyword + table, flags=re.IGNORECASE)
+            return f"{replaced_stmt}\n{comment}"
+    return None
 
 def scan_unit(unit: Unit) -> Dict[str, Any]:
     src = unit.code or ""
     findings: List[Dict[str, Any]] = []
 
-    # --- Table usage scan (your code) ---
     for m in TABLE_USAGE_RE.finditer(src):
         table = m.group("table")
         t_up = table.upper()
         stmt_text = m.group(0)
-        if t_up not in OBSOLETE_TABLE_MAP:
+        repl = migrate_table_usage(m.group("keyword"), table)
+        if not repl:
             continue  # Only mark obsolete tables
-        new_table = OBSOLETE_TABLE_MAP[t_up]
 
         finding = {
             "pgm_name": unit.pgm_name,
@@ -107,46 +102,17 @@ def scan_unit(unit: Unit) -> Dict[str, Any]:
             "severity": "warning",
             "line": line_of_offset(src, m.start()),
             "message": (
-                f"Obsolete table {table} used. Replace with CDS view {new_table} per SAP Note 3404390."
+                f"Obsolete table {table} used. Replace with CDS view {OBSOLETE_TABLE_MAP[t_up]} per SAP Note 3404390."
             ),
-            "suggestion": make_generic_suggestion(table, new_table),
+            "suggestion": repl,
             "snippet": snippet_at(src, m.start(), m.end()),
             "meta": {
                 "original_table": table,
-                "replacement_view": new_table,
+                "replacement_view": OBSOLETE_TABLE_MAP[t_up],
                 "original_statement": stmt_text.strip()
             }
         }
         findings.append(finding)
-
-    # --- Additional: Scan declarations with obsolete table types ---
-    for m in J1BBRANCH_TYPE_DECL_RE.finditer(src):
-        stmt_text = m.group(0)
-        table = "J_1BBRANCH"
-        new_table = OBSOLETE_TABLE_MAP[table]
-        finding = {
-            "pgm_name": unit.pgm_name,
-            "inc_name": unit.inc_name,
-            "type": unit.type,
-            "name": unit.name,
-            "start_line": unit.start_line,
-            "end_line": unit.end_line,
-            "issue_type": "ObsoleteTableDeclaration",
-            "severity": "warning",
-            "line": line_of_offset(src, m.start()),
-            "message": (
-                f"Obsolete table type usage: J_1BBRANCH in declaration. Replace with CDS view {new_table} per SAP Note 3404390."
-            ),
-            "suggestion": make_generic_suggestion(table, new_table),
-            "snippet": snippet_at(src, m.start(), m.end()),
-            "meta": {
-                "original_table": table,
-                "replacement_view": new_table,
-                "original_statement": stmt_text.strip()
-            }
-        }
-        findings.append(finding)
-
     obj = unit.model_dump()
     obj["j1bbranch_findings"] = findings
     return obj
